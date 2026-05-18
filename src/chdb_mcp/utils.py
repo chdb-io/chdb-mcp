@@ -17,18 +17,13 @@ def truncate(payload: str, limit: int) -> str:
     encoded = payload.encode("utf-8")
     if len(encoded) <= limit:
         return payload
-    return encoded[:limit].decode("utf-8", errors="ignore") + _TRUNCATION_NOTICE.format(
-        limit=limit
-    )
+    return encoded[:limit].decode("utf-8", errors="ignore") + _TRUNCATION_NOTICE.format(limit=limit)
 
 
 def quote_ident(name: str) -> str:
     """Backtick-quote a SQL identifier; reject anything needing escapes."""
     if not _IDENT_RE.match(name):
-        raise ValueError(
-            f"invalid SQL identifier: {name!r} "
-            "(must match [A-Za-z_][A-Za-z0-9_]*)"
-        )
+        raise ValueError(f"invalid SQL identifier: {name!r} (must match [A-Za-z_][A-Za-z0-9_]*)")
     return f"`{name}`"
 
 
