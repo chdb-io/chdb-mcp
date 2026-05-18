@@ -72,6 +72,28 @@ def test_writes_are_blocked_by_default() -> None:
         query("CREATE TABLE default.should_not_exist (a Int32) ENGINE=Memory")
 
 
+def test_run_truncates_output_at_max_result_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Confirm `_run()` actually applies `truncate(_, _CONFIG.max_result_bytes)`.
+
+    Guards against a regression where someone refactors `_run()` and silently
+    drops the `truncate()` call — the unit tests of `truncate()` itself would
+    still pass, but the MCP channel would receive unbounded payloads.
+    """
+    from chdb_mcp import server
+    from chdb_mcp.config import Config
+
+    # Tight 200-byte limit; a 100-row JSONCompact output is ~700 bytes — well over.
+    tiny = Config(readonly=True, max_result_bytes=200, file_allowlist=(), session_path=None)
+    monkeypatch.setattr(server, "_CONFIG", tiny)
+
+    out = query("SELECT number FROM system.numbers LIMIT 100", "JSONCompact")
+    assert "truncated at 200 bytes" in out
+    # Trimmed body (≤200 B) + truncation notice (~80 B); total well under 400 B.
+    assert len(out.encode("utf-8")) < 400
+
+
 def test_list_databases_includes_system() -> None:
     out = list_databases()
     assert "system" in out

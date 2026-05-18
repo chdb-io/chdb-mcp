@@ -186,9 +186,7 @@ def get_sample_data(database: str, table: str, limit: int = 10) -> str:
         limit: Maximum rows. Clamped to ``[1, 1000]``.
     """
     n = max(1, min(int(limit), 1000))
-    return _run(
-        f"SELECT * FROM {quote_ident(database)}.{quote_ident(table)} LIMIT {n}"
-    )
+    return _run(f"SELECT * FROM {quote_ident(database)}.{quote_ident(table)} LIMIT {n}")
 
 
 def main() -> None:
