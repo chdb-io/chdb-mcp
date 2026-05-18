@@ -1,0 +1,42 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.chdb-io/chdb-mcp",
+  "description": "In-process OLAP for AI agents — query Parquet, CSV, JSON, pandas DataFrames, and remote ClickHouse with one tool. Powered by chDB.",
+  "repository": {
+    "url": "https://github.com/chdb-io/chdb-mcp",
+    "source": "github"
+  },
+  "version_detail": {
+    "version": "0.1.0",
+    "release_date": "2026-05-15",
+    "is_latest": true
+  },
+  "packages": [
+    {
+      "registry_name": "pypi",
+      "name": "chdb-mcp",
+      "version": "0.1.0",
+      "runtime_hint": "uvx",
+      "environment_variables": [
+        {
+          "name": "CHDB_MCP_WRITE",
+          "description": "Set to 1 to allow INSERT/CREATE/DROP/ALTER (default: read-only)."
+        },
+        {
+          "name": "CHDB_MCP_MAX_RESULT_BYTES",
+          "description": "Per-tool result truncation threshold in bytes (default: 1048576)."
+        },
+        {
+          "name": "CHDB_MCP_FILE_ALLOWLIST",
+          "description": "Colon-separated path prefixes from which query_file() may read."
+        },
+        {
+          "name": "CHDB_MCP_SESSION_PATH",
+          "description": "Directory for a persistent chDB session; if unset, session is in-memory."
+        }
+      ]
+    }
+  ],
+  "remotes": [],
+  "transport": "stdio"
+}

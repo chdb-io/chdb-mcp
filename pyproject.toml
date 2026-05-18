@@ -1,0 +1,77 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "chdb-mcp"
+version = "0.1.0"
+description = "MCP server for chDB — the in-process SQL OLAP engine powered by ClickHouse. Lets AI agents query Parquet, CSV, JSON, and pandas DataFrames with one tool."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Shawn Chen", email = "changshuo.chen@clickhouse.com" },
+]
+keywords = ["mcp", "chdb", "clickhouse", "olap", "ai", "agent", "llm"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "mcp>=1.2.0",
+    "chdb>=4.1.0",
+    "pydantic>=2.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+    "mypy>=1.10",
+    "build>=1.2",
+]
+
+[project.scripts]
+chdb-mcp = "chdb_mcp.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/chdb-io/chdb-mcp"
+Repository = "https://github.com/chdb-io/chdb-mcp"
+Documentation = "https://github.com/chdb-io/chdb-mcp#readme"
+Issues = "https://github.com/chdb-io/chdb-mcp/issues"
+Changelog = "https://github.com/chdb-io/chdb-mcp/releases"
+
+[tool.mcp]
+mcpName = "io.github.chdb-io/chdb-mcp"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/chdb_mcp"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B", "SIM", "RUF"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-ra --strict-markers"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src/chdb_mcp"]
