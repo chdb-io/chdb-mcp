@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "chdb-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server for chDB — the in-process SQL OLAP engine powered by ClickHouse. Lets AI agents query Parquet, CSV, JSON, and pandas DataFrames with one tool."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -75,3 +75,10 @@ addopts = "-ra --strict-markers"
 python_version = "3.11"
 strict = true
 files = ["src/chdb_mcp"]
+
+# chDB ships without a py.typed marker (and is a thin wrapper over a large C++
+# core), so mypy can't see its types. Silence the resulting import-untyped
+# errors locally while keeping `strict = true` for our own code.
+[[tool.mypy.overrides]]
+module = ["chdb", "chdb.*"]
+ignore_missing_imports = true

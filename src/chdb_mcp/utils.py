@@ -11,43 +11,112 @@ _TRUNCATION_NOTICE = (
     "narrow the query or raise CHDB_MCP_MAX_RESULT_BYTES ...]"
 )
 
-# Table functions that reach outside the chDB process. When CHDB_MCP_FILE_ALLOWLIST
-# is configured the user is signalling filesystem-isolation intent; any of these
-# in a raw query() would bypass the allowlist (or, for url/s3/remote/db drivers,
-# punch through to the network).
-_EXTERNAL_SOURCE_FNS = (
-    "file",
-    "url",
-    "urlWithHeaders",
-    "s3",
-    "s3Cluster",
-    "remote",
-    "remoteSecure",
-    "cluster",
-    "clusterAllReplicas",
-    "hdfs",
-    "hdfsCluster",
-    "mongodb",
-    "postgresql",
-    "mysql",
-    "redis",
-    "sqlite",
-    "odbc",
-    "jdbc",
-    "iceberg",
-    "icebergS3",
-    "icebergCluster",
-    "deltaLake",
-    "deltaLakeCluster",
-    "azureBlobStorage",
-    "azureBlobStorageCluster",
-    "gcs",
+# Table functions that are safe by construction: they consume only literal /
+# synthetic arguments and never reach outside the chDB process. Lowercase so
+# matching against `system.table_functions` is case-insensitive. Anything in
+# `system.table_functions` that is NOT in this set is treated as "potentially
+# external" when CHDB_MCP_FILE_ALLOWLIST is configured.
+#
+# Note on `view`/`merge`/`dictionary`: these can *contain* nested table-function
+# calls (e.g. `view(SELECT * FROM file(...))`), but the text-level scanner sees
+# the inner `file(` directly, so allowlisting the wrappers is safe.
+SAFE_TABLE_FUNCTIONS = frozenset(
+    {
+        "numbers",
+        "numbers_mt",
+        "zeros",
+        "zeros_mt",
+        "null",
+        "values",
+        "format",
+        "input",
+        "generaterandom",
+        "generateseries",
+        "generate_series",
+        "primes",
+        "loop",
+        "fuzzquery",
+        "fuzzjson",
+        "view",
+        "viewexplain",
+        "viewifpermitted",
+        "dictionary",
+        "merge",
+        "mergetreeindex",
+        "mergetreeprojection",
+        "mergetreeanalyzeindexes",
+        "mergetreeanalyzeindexesuuid",
+        "mergetreetextindex",
+        "timeseriesdata",
+        "timeseriesmetrics",
+        "timeseriesselector",
+        "timeseriestags",
+    }
 )
 
-# Match a function-call token: word boundary, name, optional whitespace, '('.
-_EXTERNAL_SOURCE_RE = re.compile(
-    r"\b(" + "|".join(_EXTERNAL_SOURCE_FNS) + r")\s*\(",
-    re.IGNORECASE,
+# Conservative fallback when `system.table_functions` can't be queried at
+# session init (older chDB / build without it). Covers every table function
+# that reaches outside the process on chDB 26.3, including the RCE-class
+# `executable` and `python`. Kept lowercase to match the scanner.
+FALLBACK_KNOWN_TABLE_FUNCTIONS = frozenset(
+    {
+        "file",
+        "filecluster",
+        "url",
+        "urlcluster",
+        "urlwithheaders",
+        "s3",
+        "s3cluster",
+        "remote",
+        "remotesecure",
+        "cluster",
+        "clusterallreplicas",
+        "hdfs",
+        "hdfscluster",
+        "mongodb",
+        "postgresql",
+        "mysql",
+        "redis",
+        "sqlite",
+        "odbc",
+        "jdbc",
+        "iceberg",
+        "iceberglocal",
+        "iceberglocalcluster",
+        "icebergs3",
+        "icebergs3cluster",
+        "icebergazure",
+        "icebergazurecluster",
+        "iceberghdfs",
+        "iceberghdfscluster",
+        "deltalake",
+        "deltalakelocal",
+        "deltalakeazure",
+        "deltalakeazurecluster",
+        "deltalakes3",
+        "deltalakes3cluster",
+        "hudi",
+        "hudicluster",
+        "paimon",
+        "paimonlocal",
+        "paimonazure",
+        "paimonazurecluster",
+        "paimonhdfs",
+        "paimonhdfscluster",
+        "paimons3",
+        "paimons3cluster",
+        "paimoncluster",
+        "azureblobstorage",
+        "azureblobstoragecluster",
+        "gcs",
+        "cosn",
+        "oss",
+        "ytsaurus",
+        "executable",
+        "python",
+        "prometheusquery",
+        "prometheusqueryrange",
+    }
 )
 
 # Single pass over the SQL: a token is either a string literal, a block
@@ -65,6 +134,14 @@ _MASK_RE = re.compile(
     r"|/\*.*?\*/",  # block comment
     re.DOTALL,
 )
+
+# Backtick or double-quote wrapped identifier. Same quote required on both
+# sides (backref) so mismatched quotes don't normalize, and the inner has to
+# be a bare word (`\w+`) — chDB function names never contain quotes/dots.
+_QUOTED_IDENT_RE = re.compile(r'(?P<q>[`"])(?P<name>\w+)(?P=q)')
+
+# A function-call token: a word followed by optional whitespace and `(`.
+_CALL_RE = re.compile(r"\b(\w+)\s*\(", re.IGNORECASE)
 
 
 def truncate(payload: str, limit: int) -> str:
@@ -95,13 +172,32 @@ def quote_string(value: str) -> str:
     return "'" + value.replace("\\", "\\\\").replace("'", "''") + "'"
 
 
-def find_external_source_calls(sql: str) -> list[str]:
-    """Return the distinct external-source table functions invoked in `sql`.
+def find_disallowed_table_function_calls(sql: str, known: frozenset[str]) -> list[str]:
+    """Return distinct table-function calls in `sql` that are not safe.
 
-    String literals and SQL comments are masked in a single left-to-right pass
-    so that a string containing `/*` or `--` cannot smuggle a real function
-    call past the scanner, and a comment containing `'` cannot mis-pair with
-    later quotes to consume real SQL.
+    Steps:
+      1. Mask out string literals and SQL comments (single left-to-right pass
+         so neither can smuggle the other).
+      2. Normalize quoted identifiers: ``\\`file\\`(``  → ``file(``,
+         ``\"file\"(`` → ``file(``. Without this, agents can bypass the scan
+         by quoting the function name.
+      3. Pick every ``word(`` token; flag any whose lowercase name is in
+         ``known`` (the universe of table functions in the live chDB) but NOT
+         in ``SAFE_TABLE_FUNCTIONS``. Scalar functions (``sum``, ``length``,
+         ``concat`` etc.) aren't table functions so they aren't in ``known``
+         and never flag — text-scanning is enough.
+
+    The caller passes the dynamic ``known`` set (queried from
+    ``system.table_functions`` at session start) so the gate stays in sync
+    with whatever the running engine actually exposes — no hand-maintained
+    denylist that goes stale when chDB adds ``paimon`` /
+    ``prometheusQueryRange`` / ``iceberg…``.
     """
     masked = _MASK_RE.sub(" ", sql)
-    return sorted({m.group(1).lower() for m in _EXTERNAL_SOURCE_RE.finditer(masked)})
+    normalized = _QUOTED_IDENT_RE.sub(r"\g<name>", masked)
+    hits: set[str] = set()
+    for m in _CALL_RE.finditer(normalized):
+        name = m.group(1).lower()
+        if name in known and name not in SAFE_TABLE_FUNCTIONS:
+            hits.add(name)
+    return sorted(hits)

@@ -7,15 +7,15 @@
     "source": "github"
   },
   "version_detail": {
-    "version": "0.1.0",
-    "release_date": "2026-05-15",
+    "version": "0.2.0",
+    "release_date": "2026-05-19",
     "is_latest": true
   },
   "packages": [
     {
       "registry_name": "pypi",
       "name": "chdb-mcp",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "runtime_hint": "uvx",
       "environment_variables": [
         {
@@ -24,11 +24,15 @@
         },
         {
           "name": "CHDB_MCP_MAX_RESULT_BYTES",
-          "description": "Per-tool result truncation threshold in bytes (default: 1048576)."
+          "description": "Per-tool result cap in bytes (default: 1048576). Enforced engine-side via max_block_size + max_result_bytes + result_overflow_mode='break', then a final Python slice."
+        },
+        {
+          "name": "CHDB_MCP_QUERY_TIMEOUT_SEC",
+          "description": "Wall-clock cap per query in seconds (default: 30). Injected as chDB's max_execution_time. 0 disables."
         },
         {
           "name": "CHDB_MCP_FILE_ALLOWLIST",
-          "description": "Colon-separated path prefixes from which query_file() may read."
+          "description": "Colon-separated path prefixes. Opt-in filesystem isolation. When set, query_file() rejects paths outside the prefixes, and both query() and query_file() reject any table function not on the safe-by-construction list (file/url/s3/remote/executable/python/iceberg*/paimon*/...). When unset, no gating — the host process is trusted."
         },
         {
           "name": "CHDB_MCP_SESSION_PATH",
