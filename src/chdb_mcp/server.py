@@ -17,7 +17,8 @@ from mcp.server.fastmcp import FastMCP
 from chdb_mcp import __version__
 from chdb_mcp.config import Config
 from chdb_mcp.utils import (
-    find_external_source_calls,
+    FALLBACK_KNOWN_TABLE_FUNCTIONS,
+    find_disallowed_table_function_calls,
     quote_ident,
     quote_string,
     truncate,
@@ -30,6 +31,11 @@ log = logging.getLogger("chdb_mcp")
 
 _CONFIG: Config = Config.from_env()
 _SESSION: Session | None = None
+# Lowercase names of every table function the live chDB exposes. Populated
+# once at session init from system.table_functions, then used by the
+# allowlist scanner so we don't have to keep a denylist in lock-step with
+# upstream chDB releases. Stays empty until a session is opened.
+_KNOWN_TABLE_FUNCTIONS: frozenset[str] = frozenset()
 
 # Resolve allowlist prefixes once so symlinks normalize the same way as
 # user-supplied paths. On macOS this matters: /tmp is a symlink to /private/tmp,
@@ -41,7 +47,7 @@ _RESOLVED_ALLOWLIST: tuple[str, ...] = tuple(
 
 def _get_session() -> Session:
     """Lazily open the chDB session; apply readonly + resource caps once."""
-    global _SESSION
+    global _SESSION, _KNOWN_TABLE_FUNCTIONS
     if _SESSION is not None:
         return _SESSION
 
@@ -52,6 +58,23 @@ def _get_session() -> Session:
         if _CONFIG.session_path
         else chdb_session.Session()
     )
+
+    # Snapshot the universe of table functions the running chDB build actually
+    # exposes. The scanner below consults this set so we don't have to
+    # hand-maintain a denylist as chDB adds new external-source functions
+    # (paimon*, prometheusQuery*, iceberg* variants, etc.). Fall back to a
+    # conservative hardcoded set if the catalog query fails (older builds).
+    try:
+        rows = _SESSION.query(
+            "SELECT lower(name) FROM system.table_functions", "TabSeparated"
+        )
+        names = {line.strip() for line in str(rows).splitlines() if line.strip()}
+        _KNOWN_TABLE_FUNCTIONS = frozenset(names) if names else FALLBACK_KNOWN_TABLE_FUNCTIONS
+    except Exception as e:  # pragma: no cover — defensive against catalog issues
+        log.warning(
+            "system.table_functions unavailable (%s); using fallback denylist", e
+        )
+        _KNOWN_TABLE_FUNCTIONS = FALLBACK_KNOWN_TABLE_FUNCTIONS
 
     # Cap engine work BEFORE flipping readonly=2, in case a future chDB release
     # tightens which settings stay writable under readonly. Order is defensive.
@@ -135,22 +158,30 @@ def _check_path(path: str) -> None:
         )
 
 
-def _reject_external_sources_if_allowlist_set(sql: str) -> None:
-    """When allowlist is configured, raw query() must not reach external sources.
+def _reject_unsafe_table_functions_if_allowlist_set(sql: str, *, source: str) -> None:
+    """Block any non-safe table-function call in user-provided SQL when the
+    allowlist is configured.
 
-    Without this guard, an agent could trivially bypass the allowlist via
-    ``SELECT * FROM file('/etc/passwd', 'LineAsString')`` — making the allowlist
-    a false-comfort feature. With allowlist set, route file access through
-    query_file() (which path-checks); for s3/url/remote/etc., unset the allowlist.
+    Applied to:
+      - ``query(sql)``: the entire user SQL.
+      - ``query_file(path, sql, ...)``: the user SQL *before* the ``{file}``
+        placeholder is substituted. The injected ``file('path', ...)`` is the
+        only allowed external reach, and it's gated by ``_check_path``.
+
+    ``find_disallowed_table_function_calls`` consults the dynamic snapshot of
+    ``system.table_functions`` so the gate stays in sync with the running
+    engine, and it normalizes ``\\`file\\``` / ``\"file\"`` to ``file`` so
+    quoting the identifier can't sneak a call past the scanner.
     """
     if not _RESOLVED_ALLOWLIST:
         return
-    hits = find_external_source_calls(sql)
+    hits = find_disallowed_table_function_calls(sql, _KNOWN_TABLE_FUNCTIONS)
     if hits:
         raise ValueError(
-            f"query() refuses external table functions {hits} while "
-            f"CHDB_MCP_FILE_ALLOWLIST is set; use query_file() for files, "
-            f"or unset the allowlist to allow url/s3/remote/etc."
+            f"{source} refuses non-safe table functions {hits} while "
+            f"CHDB_MCP_FILE_ALLOWLIST is set; for files use query_file() with "
+            f"the {{file}} placeholder, or unset the allowlist to allow "
+            f"url/s3/remote/executable/python/etc."
         )
 
 
@@ -192,11 +223,16 @@ def query(sql: str, format: str = "JSONCompact") -> str:
     Args:
         sql: Any read-only SQL (SELECT/SHOW/DESCRIBE/EXPLAIN). Writes require
             ``CHDB_MCP_WRITE=1``. When ``CHDB_MCP_FILE_ALLOWLIST`` is set,
-            external table functions (file/url/s3/remote/...) are rejected
-            here; use ``query_file()`` for files instead.
+            any table function that isn't on the safe-by-construction list
+            (numbers/values/view/merge/dictionary/etc.) is rejected — that
+            includes file/url/s3/remote/executable/python and every other
+            external-reach function chDB exposes. Use ``query_file()`` for
+            files instead.
         format: Output format passed to chDB. Defaults to ``JSONCompact``.
     """
-    _reject_external_sources_if_allowlist_set(sql)
+    # Force session init so _KNOWN_TABLE_FUNCTIONS is populated before scanning.
+    _get_session()
+    _reject_unsafe_table_functions_if_allowlist_set(sql, source="query()")
     return _run(sql, format, tool="query")
 
 
@@ -258,12 +294,22 @@ def query_file(path: str, sql: str, format: str = "Parquet") -> str:
         path: Filesystem path. If ``CHDB_MCP_FILE_ALLOWLIST`` is set, the
             resolved path must sit under one of its prefixes.
         sql: Query body. Must contain the literal placeholder ``{file}``.
+            When ``CHDB_MCP_FILE_ALLOWLIST`` is set, the SQL is scanned
+            before substitution; any extra table function call other than
+            the placeholder (e.g. a UNION with ``file('/etc/passwd', ...)``
+            or a stray ``url()``/``executable()``) is rejected.
         format: chDB file format hint. Common values: ``Parquet``, ``CSV``,
             ``CSVWithNames``, ``JSONEachRow``, ``Arrow``.
     """
     _check_path(path)
     if "{file}" not in sql:
         raise ValueError("sql must contain the literal placeholder '{file}'")
+    # Scan BEFORE substitution: the user's SQL must not contain any
+    # non-safe table function. The placeholder is the only allowed external
+    # reach, and `_check_path` already gated it. After substitution our own
+    # injected `file()` would otherwise look like a violation to the scanner.
+    _get_session()
+    _reject_unsafe_table_functions_if_allowlist_set(sql, source="query_file()")
     file_expr = f"file({quote_string(path)}, {quote_string(format)})"
     rendered_sql = sql.replace("{file}", file_expr)
     return _run(rendered_sql, tool="query_file")
