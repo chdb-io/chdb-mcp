@@ -11,7 +11,7 @@ concurrency:
 
 jobs:
   lint:
-    name: Lint (ruff)
+    name: Lint (ruff + mypy)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,6 +22,7 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: ruff check src tests
       - run: ruff format --check src tests
+      - run: mypy src/chdb_mcp
 
   test:
     name: Test (py${{ matrix.python-version }} · ${{ matrix.os }})
