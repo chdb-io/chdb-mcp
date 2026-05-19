@@ -111,17 +111,13 @@ def test_scanner_flags_external_sources() -> None:
 
 
 def test_scanner_is_case_insensitive() -> None:
-    assert find_disallowed_table_function_calls("SELECT FILE('x','CSV')", _TEST_KNOWN) == [
-        "file"
-    ]
+    assert find_disallowed_table_function_calls("SELECT FILE('x','CSV')", _TEST_KNOWN) == ["file"]
     assert find_disallowed_table_function_calls("SELECT URL('h')", _TEST_KNOWN) == ["url"]
 
 
 def test_scanner_ignores_strings_and_comments() -> None:
     assert find_disallowed_table_function_calls("SELECT 's3(\\'x\\')' AS s", _TEST_KNOWN) == []
-    assert (
-        find_disallowed_table_function_calls("SELECT 1 -- file('/x')\nFROM t", _TEST_KNOWN) == []
-    )
+    assert find_disallowed_table_function_calls("SELECT 1 -- file('/x')\nFROM t", _TEST_KNOWN) == []
     assert find_disallowed_table_function_calls("SELECT /* url('x') */ 1", _TEST_KNOWN) == []
 
 
@@ -129,9 +125,7 @@ def test_scanner_does_not_match_substring() -> None:
     # `filename` and `s3hash` aren't in the known set, so they're ignored
     # regardless of word-boundary behavior.
     assert (
-        find_disallowed_table_function_calls(
-            "SELECT filename(x), s3hash(y) FROM t", _TEST_KNOWN
-        )
+        find_disallowed_table_function_calls("SELECT filename(x), s3hash(y) FROM t", _TEST_KNOWN)
         == []
     )
 
@@ -163,16 +157,16 @@ def test_scanner_normalizes_backtick_quoted_function_name() -> None:
     assert find_disallowed_table_function_calls(
         "SELECT * FROM `file`('/etc/passwd', 'LineAsString')", _TEST_KNOWN
     ) == ["file"]
-    assert find_disallowed_table_function_calls(
-        "SELECT * FROM `s3`('s3://b/x')", _TEST_KNOWN
-    ) == ["s3"]
+    assert find_disallowed_table_function_calls("SELECT * FROM `s3`('s3://b/x')", _TEST_KNOWN) == [
+        "s3"
+    ]
 
 
 def test_scanner_normalizes_double_quoted_function_name() -> None:
     """P0-2 attack vector: chDB also accepts \"file\"(...). Same treatment as
     backticks."""
     assert find_disallowed_table_function_calls(
-        'SELECT * FROM "file"(\'/etc/passwd\', \'LineAsString\')', _TEST_KNOWN
+        "SELECT * FROM \"file\"('/etc/passwd', 'LineAsString')", _TEST_KNOWN
     ) == ["file"]
 
 
@@ -207,9 +201,7 @@ def test_scanner_lets_safe_table_functions_through() -> None:
         == []
     )
     # view() can wrap arbitrary SQL but the text-level scanner sees inside.
-    assert (
-        find_disallowed_table_function_calls("SELECT * FROM view(SELECT 1)", _TEST_KNOWN) == []
-    )
+    assert find_disallowed_table_function_calls("SELECT * FROM view(SELECT 1)", _TEST_KNOWN) == []
     # view() containing a non-safe call is still flagged via the inner token.
     assert find_disallowed_table_function_calls(
         "SELECT * FROM view(SELECT * FROM file('/etc/passwd', 'CSV'))", _TEST_KNOWN
@@ -223,9 +215,7 @@ def test_scanner_ignores_unknown_table_functions() -> None:
     stale."""
     # `madeupfn` is not in _TEST_KNOWN.
     assert (
-        find_disallowed_table_function_calls(
-            "SELECT * FROM madeupfn('whatever')", _TEST_KNOWN
-        )
+        find_disallowed_table_function_calls("SELECT * FROM madeupfn('whatever')", _TEST_KNOWN)
         == []
     )
 
@@ -380,7 +370,7 @@ def test_query_rejects_quoted_function_name_bypass(
     with pytest.raises(ValueError, match=r"non-safe table functions"):
         query("SELECT count() FROM `file`('/etc/passwd', 'LineAsString')")
     with pytest.raises(ValueError, match=r"non-safe table functions"):
-        query('SELECT count() FROM "file"(\'/etc/passwd\', \'LineAsString\')')
+        query("SELECT count() FROM \"file\"('/etc/passwd', 'LineAsString')")
 
 
 def test_query_rejects_rce_class_table_functions(
@@ -404,8 +394,13 @@ def test_query_file_rejects_extra_external_calls_in_user_sql(
     substitution."""
     from chdb_mcp import server
 
-    monkeypatch.setattr(server, "_RESOLVED_ALLOWLIST", ("/tmp",))
-    with tempfile.NamedTemporaryFile("w", suffix=".csv", dir="/tmp", delete=False) as fh:
+    # _RESOLVED_ALLOWLIST must hold paths in their symlink-resolved form, the
+    # same form _check_path() compares against. On macOS /tmp resolves to
+    # /private/tmp, so writing a literal "/tmp" here would make the path
+    # check fail first and the assertion below would catch the wrong error.
+    resolved_tmp = str(Path("/tmp").resolve())
+    monkeypatch.setattr(server, "_RESOLVED_ALLOWLIST", (resolved_tmp,))
+    with tempfile.NamedTemporaryFile("w", suffix=".csv", dir=resolved_tmp, delete=False) as fh:
         fh.write("a\n1\n2\n")
         benign = fh.name
     try:
@@ -429,8 +424,9 @@ def test_query_file_normal_use_still_works_with_allowlist(
     no false positives on the placeholder."""
     from chdb_mcp import server
 
-    monkeypatch.setattr(server, "_RESOLVED_ALLOWLIST", ("/tmp",))
-    with tempfile.NamedTemporaryFile("w", suffix=".csv", dir="/tmp", delete=False) as fh:
+    resolved_tmp = str(Path("/tmp").resolve())
+    monkeypatch.setattr(server, "_RESOLVED_ALLOWLIST", (resolved_tmp,))
+    with tempfile.NamedTemporaryFile("w", suffix=".csv", dir=resolved_tmp, delete=False) as fh:
         fh.write("a\n1\n2\n3\n")
         path = fh.name
     try:

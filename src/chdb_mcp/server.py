@@ -65,15 +65,11 @@ def _get_session() -> Session:
     # (paimon*, prometheusQuery*, iceberg* variants, etc.). Fall back to a
     # conservative hardcoded set if the catalog query fails (older builds).
     try:
-        rows = _SESSION.query(
-            "SELECT lower(name) FROM system.table_functions", "TabSeparated"
-        )
+        rows = _SESSION.query("SELECT lower(name) FROM system.table_functions", "TabSeparated")
         names = {line.strip() for line in str(rows).splitlines() if line.strip()}
         _KNOWN_TABLE_FUNCTIONS = frozenset(names) if names else FALLBACK_KNOWN_TABLE_FUNCTIONS
     except Exception as e:  # pragma: no cover — defensive against catalog issues
-        log.warning(
-            "system.table_functions unavailable (%s); using fallback denylist", e
-        )
+        log.warning("system.table_functions unavailable (%s); using fallback denylist", e)
         _KNOWN_TABLE_FUNCTIONS = FALLBACK_KNOWN_TABLE_FUNCTIONS
 
     # Cap engine work BEFORE flipping readonly=2, in case a future chDB release
