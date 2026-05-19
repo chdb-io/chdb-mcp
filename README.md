@@ -43,6 +43,7 @@ pip install chdb-mcp
 | `describe_table(database, table)` | Column types for a table |
 | `query_file(path, sql, format)` | Query a Parquet/CSV/JSON file via the `{file}` placeholder |
 | `get_sample_data(database, table, limit)` | First N rows of a table |
+| `list_functions(pattern)` | List ClickHouse SQL functions (optional substring filter) |
 
 Read-only by default — `SET readonly=2` blocks `INSERT`/`CREATE`/`DROP`/`ALTER` while keeping `file()`/`url()`/`s3()` usable. Set `CHDB_MCP_WRITE=1` to drop the guard. See [Security model](#security-model).
 
@@ -61,19 +62,37 @@ query_file(
 | Variable | Default | Effect |
 |---|---|---|
 | `CHDB_MCP_WRITE` | unset | If `1`, allows `INSERT`/`CREATE`/`DROP`/`ALTER` |
-| `CHDB_MCP_MAX_RESULT_BYTES` | `1048576` | Per-tool result truncation threshold |
-| `CHDB_MCP_FILE_ALLOWLIST` | empty | `:`-separated path prefixes for `query_file()`; symlinks resolved on both sides. **Advisory** — see [Security model](#security-model). |
+| `CHDB_MCP_MAX_RESULT_BYTES` | `1048576` | Per-tool result cap. Enforced engine-side (`max_result_bytes` + `result_overflow_mode='break'`) plus a final Python slice. |
+| `CHDB_MCP_QUERY_TIMEOUT_SEC` | `30` | Wall-clock cap per query (chDB `max_execution_time`). `0` disables. |
+| `CHDB_MCP_FILE_ALLOWLIST` | empty (unrestricted) | `:`-separated path prefixes. **Opt-in isolation switch** — when set, `query_file()` rejects paths outside the prefixes, and `query()` rejects external table functions (`file`/`url`/`s3`/`remote`/`hdfs`/`mongodb`/...). When unset, no filesystem gating happens — the host process is trusted. |
 | `CHDB_MCP_SESSION_PATH` | empty | Persistent session directory (default: ephemeral) |
 
 ## Security model
 
-**Protects against**: accidental writes (`readonly=2`), runaway result sizes (per-tool truncation), SQL-identifier injection in `list_tables` / `describe_table` / `get_sample_data` arguments (whitelist regex + escaping).
+chDB is **in-process**. There is no privilege boundary between the MCP server and the host Python interpreter, so the server can't make stronger isolation guarantees than the host already gives it. The model below reflects that.
 
-**Does NOT protect against**:
+### Trust tiers
 
-- **Filesystem reach.** `CHDB_MCP_FILE_ALLOWLIST` only guards `query_file()`; the `query()` tool accepts arbitrary SQL, and chDB exposes `file()` / `url()` / `s3()` / `remote()` directly. A determined caller bypasses the allowlist. Use OS-level isolation (macOS App Sandbox, Linux namespaces, Docker with a read-only mount) for real sandboxing.
-- **SQL audit.** Only the readonly guard — no allow/deny list of statements. Treat the agent as having full `SELECT` access to anything chDB can reach.
-- **Resource limits.** No memory / CPU / wall-clock caps in v0.1. Use `ulimit` / `cgroups` if needed.
+1. **Default (no `CHDB_MCP_FILE_ALLOWLIST`)** — no filesystem gating. `query()` and `query_file()` can reach anything the host process can reach (any `file()`, `url()`, `s3()`, `remote()`...). Appropriate when the agent is trusted, or when the surrounding host application enforces the security boundary itself.
+2. **Opt-in allowlist (`CHDB_MCP_FILE_ALLOWLIST=/data:/tmp/foo`)** — best-effort defense in depth:
+   - `query_file()` rejects paths whose resolved (symlink-followed) form isn't under any listed prefix.
+   - `query()` rejects SQL containing external table functions (`file`/`url`/`s3`/`s3Cluster`/`remote`/`remoteSecure`/`hdfs`/`mongodb`/`postgresql`/`mysql`/`iceberg`/`deltaLake`/`azureBlobStorage`/`gcs`/...). The scan is comment- and string-aware.
+   - This is **not a sandbox**: a determined caller can still try to exfiltrate via undiscovered functions, settings, or future chDB features. Strong enough for casual agent mistakes, not for adversarial input.
+3. **Hard isolation** — for adversarial input, wrap the server in OS-level confinement: macOS App Sandbox, Linux user namespaces / seccomp, or Docker with a read-only filesystem mount. Nothing at the MCP layer can substitute for this.
+
+### What's protected
+
+- **Accidental writes** — `SET readonly=2` is applied at session start. `CHDB_MCP_WRITE=1` lifts it. (Note: ClickHouse's `readonly=2` still permits `TEMPORARY TABLE` writes and runtime `SET` changes — by design, not a bug.)
+- **Runaway result sizes** — `CHDB_MCP_MAX_RESULT_BYTES` is enforced engine-side (`max_block_size` + `max_result_bytes` + `result_overflow_mode='break'`), not just as a post-hoc string slice. Large queries no longer materialize multi-MiB in chDB before truncation.
+- **Runaway wall-clock** — `CHDB_MCP_QUERY_TIMEOUT_SEC` (default 30s) caps each query via chDB's `max_execution_time`.
+- **SQL-identifier injection** — `list_tables` / `describe_table` / `get_sample_data` arguments are whitelist-regex'd (`[A-Za-z_][A-Za-z0-9_]*` only) and backtick-quoted before interpolation.
+- **SQL string-literal escape** — `list_functions(pattern)` and `query_file(path, format)` arguments are passed through `quote_string`, which escapes both single quotes (`'` → `''`) and backslashes (`\` → `\\`) so that ClickHouse's `\'` escape form cannot break out of the literal.
+
+### What's NOT protected
+
+- **SQL audit.** Only the readonly guard — no allow/deny list of statements. Treat the agent as having full `SELECT` access to anything chDB can reach (subject to the allowlist when set).
+- **Setting tampering.** Under `readonly=2`, the agent can still `SET max_memory_usage = …` to raise resource caps. Lock this down at the host or via OS-level resource limits if it matters.
+- **Memory / CPU caps.** chDB's `max_memory_usage` applies, but there's no `ulimit`/`cgroups` equivalent imposed by the MCP layer.
 
 For agents acting on untrusted input, run in a throwaway container.
 
